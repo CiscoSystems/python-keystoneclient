@@ -115,26 +115,24 @@ import webob.exc
 from keystoneclient.openstack.common import jsonutils
 from keystoneclient.common import cms
 from keystoneclient import utils
+from keystoneclient.middleware import memcache_crypt
 from keystoneclient.openstack.common import timeutils
 
 CONF = None
-try:
-    from openstack.common import cfg
-    CONF = cfg.CONF
-except ImportError:
-    # cfg is not a library yet, try application copies
-    for app in 'nova', 'glance', 'quantum', 'cinder':
-        try:
-            cfg = __import__('%s.openstack.common.cfg' % app,
-                             fromlist=['%s.openstack.common' % app])
-            # test which application middleware is running in
-            if hasattr(cfg, 'CONF') and 'config_file' in cfg.CONF:
-                CONF = cfg.CONF
-                break
-        except ImportError:
-            pass
+# to pass gate before oslo-config is deployed everywhere,
+# try application copies first
+for app in 'nova', 'glance', 'quantum', 'cinder':
+    try:
+        cfg = __import__('%s.openstack.common.cfg' % app,
+                         fromlist=['%s.openstack.common' % app])
+        # test which application middleware is running in
+        if hasattr(cfg, 'CONF') and 'config_file' in cfg.CONF:
+            CONF = cfg.CONF
+            break
+    except ImportError:
+        pass
 if not CONF:
-    from keystoneclient.openstack.common import cfg
+    from oslo.config import cfg
     CONF = cfg.CONF
 
 # alternative middleware configuration in the main application's
@@ -160,16 +158,20 @@ opts = [
     cfg.StrOpt('auth_protocol', default='https'),
     cfg.StrOpt('auth_uri', default=None),
     cfg.BoolOpt('delay_auth_decision', default=False),
-    cfg.StrOpt('admin_token'),
+    cfg.BoolOpt('http_connect_timeout', default=None),
+    cfg.StrOpt('admin_token', secret=True),
     cfg.StrOpt('admin_user'),
-    cfg.StrOpt('admin_password'),
+    cfg.StrOpt('admin_password', secret=True),
     cfg.StrOpt('admin_tenant_name', default='admin'),
     cfg.StrOpt('cache', default=None),   # env key for the swift cache
     cfg.StrOpt('certfile'),
     cfg.StrOpt('keyfile'),
-    cfg.StrOpt('signing_dir'),
+    cfg.StrOpt('signing_dir',
+               default=os.path.expanduser('~/keystone-signing')),
     cfg.ListOpt('memcache_servers'),
     cfg.IntOpt('token_cache_time', default=300),
+    cfg.StrOpt('memcache_security_strategy', default=None),
+    cfg.StrOpt('memcache_secret_key', default=None, secret=True),
 ]
 CONF.register_opts(opts, group='keystone_authtoken')
 
@@ -237,8 +239,6 @@ class AuthProtocol(object):
 
         #signing
         self.signing_dirname = self._conf_get('signing_dir')
-        if self.signing_dirname is None:
-            self.signing_dirname = '%s/keystone-signing' % os.environ['HOME']
         self.LOG.info('Using %s as cache directory for signing certificate' %
                       self.signing_dirname)
         if (os.path.exists(self.signing_dirname) and
@@ -268,14 +268,35 @@ class AuthProtocol(object):
 
         # Token caching via memcache
         self._cache = None
-        self._iso8601 = None
+        self._use_keystone_cache = False
         self._cache_initialized = False    # cache already initialzied?
+        # memcache value treatment, ENCRYPT or MAC
+        self._memcache_security_strategy = \
+            self._conf_get('memcache_security_strategy')
+        if self._memcache_security_strategy is not None:
+            self._memcache_security_strategy = \
+                self._memcache_security_strategy.upper()
+        self._memcache_secret_key = \
+            self._conf_get('memcache_secret_key')
+        self._assert_valid_memcache_protection_config()
         # By default the token will be cached for 5 minutes
         self.token_cache_time = int(self._conf_get('token_cache_time'))
         self._token_revocation_list = None
         self._token_revocation_list_fetched_time = None
         cache_timeout = datetime.timedelta(seconds=0)
         self.token_revocation_list_cache_timeout = cache_timeout
+        http_connect_timeout_cfg = self._conf_get('http_connect_timeout')
+        self.http_connect_timeout = (http_connect_timeout_cfg and
+                                     int(http_connect_timeout_cfg))
+
+    def _assert_valid_memcache_protection_config(self):
+        if self._memcache_security_strategy:
+            if self._memcache_security_strategy not in ('MAC', 'ENCRYPT'):
+                raise Exception('memcache_security_strategy must be '
+                                'ENCRYPT or MAC')
+            if not self._memcache_secret_key:
+                raise Exception('mecmache_secret_key must be defined when '
+                                'a memcache_security_strategy is defined')
 
     def _init_cache(self, env):
         cache = self._conf_get('cache')
@@ -290,10 +311,9 @@ class AuthProtocol(object):
             if memcache_servers:
                 try:
                     import memcache
-                    import iso8601
                     self.LOG.info('Using Keystone memcache for caching token')
                     self._cache = memcache.Client(memcache_servers)
-                    self._iso8601 = iso8601
+                    self._use_keystone_cache = True
                 except ImportError as e:
                     msg = 'disabled caching due to missing libraries %s' % (e)
                     self.LOG.warn(msg)
@@ -379,8 +399,10 @@ class AuthProtocol(object):
         if token:
             return token
         else:
-            self.LOG.warn(
-                "Unable to find authentication token in headers: %s", env)
+            if not self.delay_auth_decision:
+                self.LOG.warn("Unable to find authentication token"
+                              " in headers")
+                self.LOG.debug("Headers: %s", env)
             raise InvalidUserToken('Unable to find token in headers')
 
     def _reject_request(self, env, start_response):
@@ -418,12 +440,14 @@ class AuthProtocol(object):
 
     def _get_http_connection(self):
         if self.auth_protocol == 'http':
-            return self.http_client_class(self.auth_host, self.auth_port)
+            return self.http_client_class(self.auth_host, self.auth_port,
+                                          timeout=self.http_connect_timeout)
         else:
             return self.http_client_class(self.auth_host,
                                           self.auth_port,
                                           self.key_file,
-                                          self.cert_file)
+                                          self.cert_file,
+                                          timeout=self.http_connect_timeout)
 
     def _http_request(self, method, path):
         """HTTP request helper used to make unspecified content type requests.
@@ -661,6 +685,54 @@ class AuthProtocol(object):
         env_key = self._header_to_env_var(key)
         return env.get(env_key, default)
 
+    def _protect_cache_value(self, token, data):
+        """ Encrypt or sign data if necessary. """
+        try:
+            if self._memcache_security_strategy == 'ENCRYPT':
+                return memcache_crypt.encrypt_data(token,
+                                                   self._memcache_secret_key,
+                                                   data)
+            elif self._memcache_security_strategy == 'MAC':
+                return memcache_crypt.sign_data(token, data)
+            else:
+                return data
+        except:
+            msg = 'Failed to encrypt/sign cache data.'
+            self.LOG.exception(msg)
+            return data
+
+    def _unprotect_cache_value(self, token, data):
+        """ Decrypt or verify signed data if necessary. """
+        if data is None:
+            return data
+
+        try:
+            if self._memcache_security_strategy == 'ENCRYPT':
+                return memcache_crypt.decrypt_data(token,
+                                                   self._memcache_secret_key,
+                                                   data)
+            elif self._memcache_security_strategy == 'MAC':
+                return memcache_crypt.verify_signed_data(token, data)
+            else:
+                return data
+        except:
+            msg = 'Failed to decrypt/verify cache data.'
+            self.LOG.exception(msg)
+            # this should have the same effect as data not found in cache
+            return None
+
+    def _get_cache_key(self, token):
+        """ Return the cache key.
+
+        Do not use clear token as key if memcache protection is on.
+
+        """
+        htoken = token
+        if self._memcache_security_strategy in ('ENCRYPT', 'MAC'):
+            derv_token = token + self._memcache_secret_key
+            htoken = memcache_crypt.hash_data(derv_token)
+        return 'tokens/%s' % htoken
+
     def _cache_get(self, token):
         """Return token information from cache.
 
@@ -668,8 +740,9 @@ class AuthProtocol(object):
         return token only if fresh (not expired).
         """
         if self._cache and token:
-            key = 'tokens/%s' % token
+            key = self._get_cache_key(token)
             cached = self._cache.get(key)
+            cached = self._unprotect_cache_value(token, cached)
             if cached == 'invalid':
                 self.LOG.debug('Cached Token %s is marked unauthorized', token)
                 raise InvalidUserToken('Token authorization failed')
@@ -681,38 +754,50 @@ class AuthProtocol(object):
                 else:
                     self.LOG.debug('Cached Token %s seems expired', token)
 
+    def _cache_store(self, token, data, expires=None):
+        """ Store value into memcache. """
+        key = self._get_cache_key(token)
+        data = self._protect_cache_value(token, data)
+        data_to_store = data
+        if expires:
+            data_to_store = (data, expires)
+        # we need to special-case set() because of the incompatibility between
+        # Swift MemcacheRing and python-memcached. See
+        # https://bugs.launchpad.net/swift/+bug/1095730
+        if self._use_keystone_cache:
+            self._cache.set(key,
+                            data_to_store,
+                            time=self.token_cache_time)
+        else:
+            self._cache.set(key,
+                            data_to_store,
+                            timeout=self.token_cache_time)
+
     def _cache_put(self, token, data):
-        """Put token data into the cache.
+        """ Put token data into the cache.
 
         Stores the parsed expire date in cache allowing
         quick check of token freshness on retrieval.
         """
         if self._cache and data:
-            key = 'tokens/%s' % token
             if 'token' in data.get('access', {}):
                 timestamp = data['access']['token']['expires']
-                expires = self._iso8601.parse_date(timestamp).strftime('%s')
+                expires = timeutils.parse_isotime(timestamp).strftime('%s')
             else:
                 self.LOG.error('invalid token format')
                 return
             self.LOG.debug('Storing %s token in memcache', token)
-            self._cache.set(key,
-                            (data, expires),
-                            time=self.token_cache_time)
+            self._cache_store(token, data, expires)
 
     def _cache_store_invalid(self, token):
         """Store invalid token in cache."""
         if self._cache:
-            key = 'tokens/%s' % token
             self.LOG.debug(
                 'Marking token %s as unauthorized in memcache', token)
-            self._cache.set(key,
-                            'invalid',
-                            time=self.token_cache_time)
+            self._cache_store(token, 'invalid')
 
-    def cert_file_missing(self, called_proc_err, file_name):
-        return (called_proc_err.output.find(file_name)
-                and not os.path.exists(file_name))
+    def cert_file_missing(self, proc_output, file_name):
+        return (file_name in proc_output and not os.path.exists(file_name))
 
     def verify_uuid_token(self, user_token, retry=True):
         """Authenticate user token with keystone.
@@ -784,10 +869,11 @@ class AuthProtocol(object):
                 output = cms.cms_verify(data, self.signing_cert_file_name,
                                         self.ca_file_name)
             except cms.subprocess.CalledProcessError as err:
-                if self.cert_file_missing(err, self.signing_cert_file_name):
+                if self.cert_file_missing(err.output,
+                                          self.signing_cert_file_name):
                     self.fetch_signing_cert()
                     continue
-                if self.cert_file_missing(err, self.ca_file_name):
+                if self.cert_file_missing(err.output, self.ca_file_name):
                     self.fetch_ca_cert()
                     continue
                 raise err
