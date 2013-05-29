@@ -33,17 +33,17 @@ from keystoneclient import exceptions
 _logger = logging.getLogger(__name__)
 
 
-# keyring init
-keyring_available = True
-try:
-    import keyring
-    import pickle
-except ImportError:
-    if (hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()):
-        print >> sys.stderr, 'Failed to load keyring modules.'
-    else:
-        _logger.warning('Failed to load keyring modules.')
-    keyring_available = False
+def try_import_keyring():
+    try:
+        import keyring
+        import pickle
+        return True
+    except ImportError:
+        if (hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()):
+            print >> sys.stderr, 'Failed to load keyring modules.'
+        else:
+            _logger.warning('Failed to load keyring modules.')
+        return False
 
 
 class HTTPClient(object):
@@ -113,7 +113,7 @@ class HTTPClient(object):
 
         # logging setup
         self.debug_log = debug
-        if self.debug_log:
+        if self.debug_log and not _logger.handlers:
             ch = logging.StreamHandler()
             _logger.setLevel(logging.DEBUG)
             _logger.addHandler(ch)
@@ -121,7 +121,7 @@ class HTTPClient(object):
                 requests.logging.getLogger(requests.__name__).addHandler(ch)
 
         # keyring setup
-        self.use_keyring = use_keyring and keyring_available
+        self.use_keyring = use_keyring and try_import_keyring()
         self.force_new_token = force_new_token
         self.stale_duration = stale_duration or access.STALE_TOKEN_DURATION
         self.stale_duration = int(self.stale_duration)
@@ -351,33 +351,38 @@ class HTTPClient(object):
             request_kwargs.setdefault('timeout', self.timeout)
 
         self.http_log_req((url, method,), request_kwargs)
-        resp = requests.request(
-            method,
-            url,
-            verify=self.verify_cert,
-            **request_kwargs)
+
+        try:
+            resp = requests.request(
+                method,
+                url,
+                verify=self.verify_cert,
+                **request_kwargs)
+        except requests.ConnectionError:
+            msg = 'Unable to establish connection to %s' % url
+            raise exceptions.ClientException(msg)
 
         self.http_log_resp(resp)
-
-        if resp.status_code >= 400:
-            _logger.debug(
-                "Request returned failure status: %s",
-                resp.status_code)
-            raise exceptions.from_response(resp, resp.text)
-        elif resp.status_code in (301, 302, 305):
-            # Redirected. Reissue the request to the new location.
-            return self.request(resp.headers['location'], method, **kwargs)
 
         if resp.text:
             try:
                 body = json.loads(resp.text)
-            except ValueError:
+            except (ValueError, TypeError):
                 body = None
                 _logger.debug("Could not decode JSON from body: %s"
                               % resp.text)
         else:
             _logger.debug("No body was returned.")
             body = None
+
+        if resp.status_code >= 400:
+            _logger.debug(
+                "Request returned failure status: %s",
+                resp.status_code)
+            raise exceptions.from_response(resp, body or resp.text)
+        elif resp.status_code in (301, 302, 305):
+            # Redirected. Reissue the request to the new location.
+            return self.request(resp.headers['location'], method, **kwargs)
 
         return resp, body
 

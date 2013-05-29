@@ -84,7 +84,8 @@ class OpenStackIdentityShell(object):
 
         parser.add_argument('--version',
                             action='version',
-                            version=keystoneclient.__version__)
+                            version=keystoneclient.__version__,
+                            help="Shows the client version and exits")
 
         parser.add_argument('--debug',
                             default=False,
@@ -208,7 +209,7 @@ class OpenStackIdentityShell(object):
                             default=env('OS_CACHE', default=False),
                             action='store_true',
                             help='Use the auth token cache. '
-                                 'Default to env[OS_CACHE]')
+                                 'Defaults to env[OS_CACHE]')
         parser.add_argument('--os_cache',
                             help=argparse.SUPPRESS)
 
@@ -216,12 +217,12 @@ class OpenStackIdentityShell(object):
                             default=False,
                             action="store_true",
                             dest='force_new_token',
-                            help="If keyring is available and in used, "
+                            help="If the keyring is available and in use, "
                                  "token will always be stored and fetched "
-                                 "from the keyring, until the token has "
+                                 "from the keyring until the token has "
                                  "expired. Use this option to request a "
                                  "new token and replace the existing one "
-                                 "in keyring.")
+                                 "in the keyring.")
 
         parser.add_argument('--stale-duration',
                             metavar='<seconds>',
@@ -298,8 +299,9 @@ class OpenStackIdentityShell(object):
             subparser.add_argument('-h', '--help', action='help',
                                    help=argparse.SUPPRESS)
             self.subcommands[command] = subparser
+            group = subparser.add_argument_group(title='Arguments')
             for (args, kwargs) in arguments:
-                subparser.add_argument(*args, **kwargs)
+                group.add_argument(*args, **kwargs)
             subparser.set_defaults(func=callback)
 
     def main(self, argv):

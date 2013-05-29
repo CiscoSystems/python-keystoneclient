@@ -61,35 +61,77 @@ HTTP_X_IDENTITY_STATUS
     The underlying service will only see a value of 'Invalid' if the Middleware
     is configured to run in 'delay_auth_decision' mode
 
-HTTP_X_TENANT_ID
-    Identity service managed unique identifier, string
+HTTP_X_DOMAIN_ID
+    Identity service managed unique identifier, string. Only present if
+    this is a domain-scoped v3 token.
 
-HTTP_X_TENANT_NAME
-    Unique tenant identifier, string
+HTTP_X_DOMAIN_NAME
+    Unique domain name, string. Only present if this is a domain-scoped
+    v3 token.
+
+HTTP_X_PROJECT_ID
+    Identity service managed unique identifier, string. Only present if
+    this is a project-scoped v3 token, or a tenant-scoped v2 token.
+
+HTTP_X_PROJECT_NAME
+    Project name, unique within owning domain, string. Only present if
+    this is a project-scoped v3 token, or a tenant-scoped v2 token.
+
+HTTP_X_PROJECT_DOMAIN_ID
+    Identity service managed unique identifier of owning domain of
+    project, string.  Only present if this is a project-scoped v3 token. If
+    this variable is set, this indicates that the PROJECT_NAME can only
+    be assumed to be unique within this domain.
+
+HTTP_X_PROJECT_DOMAIN_NAME
+    Name of owning domain of project, string. Only present if this is a
+    project-scoped v3 token. If this variable is set, this indicates that
+    the PROJECT_NAME can only be assumed to be unique within this domain.
 
 HTTP_X_USER_ID
     Identity-service managed unique identifier, string
 
 HTTP_X_USER_NAME
-    Unique user identifier, string
+    User identifier, unique within owning domain, string
+
+HTTP_X_USER_DOMAIN_ID
+    Identity service managed unique identifier of owning domain of
+    user, string. If this variable is set, this indicates that the USER_NAME
+    can only be assumed to be unique within this domain.
+
+HTTP_X_USER_DOMAIN_NAME
+    Name of owning domain of user, string. If this variable is set, this
+    indicates that the USER_NAME can only be assumed to be unique within
+    this domain.
 
 HTTP_X_ROLES
-    Comma delimited list of case-sensitive Roles
+    Comma delimited list of case-sensitive role names
 
 HTTP_X_SERVICE_CATALOG
     json encoded keystone service catalog (optional).
 
+HTTP_X_TENANT_ID
+    *Deprecated* in favor of HTTP_X_PROJECT_ID
+    Identity service managed unique identifier, string. For v3 tokens, this
+    will be set to the same value as HTTP_X_PROJECT_ID
+
+HTTP_X_TENANT_NAME
+    *Deprecated* in favor of HTTP_X_PROJECT_NAME
+    Project identifier, unique within owning domain, string. For v3 tokens,
+    this will be set to the same value as HTTP_X_PROJECT_NAME
+
 HTTP_X_TENANT
     *Deprecated* in favor of HTTP_X_TENANT_ID and HTTP_X_TENANT_NAME
-    Keystone-assigned unique identifier, deprecated
+    Keystone-assigned unique identifier, string. For v3 tokens, this
+    will be set to the same value as HTTP_X_PROJECT_ID
 
 HTTP_X_USER
     *Deprecated* in favor of HTTP_X_USER_ID and HTTP_X_USER_NAME
-    Unique user name, string
+    User name, unique within owning domain, string
 
 HTTP_X_ROLE
     *Deprecated* in favor of HTTP_X_ROLES
-    This is being renamed, and the new header contains the same data.
+    Will contain the same values as HTTP_X_ROLES.
 
 OTHER ENVIRONMENT VARIABLES
 ---------------------------
@@ -108,6 +150,7 @@ import json
 import logging
 import os
 import stat
+import tempfile
 import time
 import urllib
 import webob.exc
@@ -116,6 +159,7 @@ from keystoneclient.openstack.common import jsonutils
 from keystoneclient.common import cms
 from keystoneclient import utils
 from keystoneclient.middleware import memcache_crypt
+from keystoneclient.openstack.common import memorycache
 from keystoneclient.openstack.common import timeutils
 
 CONF = None
@@ -157,8 +201,10 @@ opts = [
     cfg.IntOpt('auth_port', default=35357),
     cfg.StrOpt('auth_protocol', default='https'),
     cfg.StrOpt('auth_uri', default=None),
+    cfg.StrOpt('auth_version', default=None),
     cfg.BoolOpt('delay_auth_decision', default=False),
     cfg.BoolOpt('http_connect_timeout', default=None),
+    cfg.StrOpt('http_handler', default=None),
     cfg.StrOpt('admin_token', secret=True),
     cfg.StrOpt('admin_user'),
     cfg.StrOpt('admin_password', secret=True),
@@ -166,14 +212,16 @@ opts = [
     cfg.StrOpt('cache', default=None),   # env key for the swift cache
     cfg.StrOpt('certfile'),
     cfg.StrOpt('keyfile'),
-    cfg.StrOpt('signing_dir',
-               default=os.path.expanduser('~/keystone-signing')),
+    cfg.StrOpt('signing_dir'),
     cfg.ListOpt('memcache_servers'),
     cfg.IntOpt('token_cache_time', default=300),
+    cfg.IntOpt('revocation_cache_time', default=1),
     cfg.StrOpt('memcache_security_strategy', default=None),
-    cfg.StrOpt('memcache_secret_key', default=None, secret=True),
+    cfg.StrOpt('memcache_secret_key', default=None, secret=True)
 ]
 CONF.register_opts(opts, group='keystone_authtoken')
+
+LIST_OF_VERSIONS_TO_ATTEMPT = ['v2.0', 'v3.0']
 
 
 def will_expire_soon(expiry):
@@ -221,10 +269,17 @@ class AuthProtocol(object):
         self.auth_host = self._conf_get('auth_host')
         self.auth_port = int(self._conf_get('auth_port'))
         self.auth_protocol = self._conf_get('auth_protocol')
-        if self.auth_protocol == 'http':
-            self.http_client_class = httplib.HTTPConnection
+        if not self._conf_get('http_handler'):
+            if self.auth_protocol == 'http':
+                self.http_client_class = httplib.HTTPConnection
+            else:
+                self.http_client_class = httplib.HTTPSConnection
         else:
-            self.http_client_class = httplib.HTTPSConnection
+            # Really only used for unit testing, since we need to
+            # have a fake handler set up before we issue an http
+            # request to get the list of versions supported by the
+            # server at the end of this initialization
+            self.http_client_class = self._conf_get('http_handler')
 
         self.auth_admin_prefix = self._conf_get('auth_admin_prefix')
         self.auth_uri = self._conf_get('auth_uri')
@@ -237,19 +292,26 @@ class AuthProtocol(object):
         self.cert_file = self._conf_get('certfile')
         self.key_file = self._conf_get('keyfile')
 
-        #signing
+        # signing
         self.signing_dirname = self._conf_get('signing_dir')
+        if self.signing_dirname is None:
+            self.signing_dirname = tempfile.mkdtemp(prefix='keystone-signing-')
         self.LOG.info('Using %s as cache directory for signing certificate' %
                       self.signing_dirname)
-        if (os.path.exists(self.signing_dirname) and
-                not os.access(self.signing_dirname, os.W_OK)):
-                raise ConfigurationError("unable to access signing dir %s" %
-                                         self.signing_dirname)
-
-        if not os.path.exists(self.signing_dirname):
-            os.makedirs(self.signing_dirname)
-        #will throw IOError  if it cannot change permissions
-        os.chmod(self.signing_dirname, stat.S_IRWXU)
+        if os.path.exists(self.signing_dirname):
+            if not os.access(self.signing_dirname, os.W_OK):
+                raise ConfigurationError(
+                    'unable to access signing_dir %s' % self.signing_dirname)
+            if os.stat(self.signing_dirname).st_uid != os.getuid():
+                self.LOG.warning(
+                    'signing_dir is not owned by %s' % os.getlogin())
+            current_mode = stat.S_IMODE(os.stat(self.signing_dirname).st_mode)
+            if current_mode != stat.S_IRWXU:
+                self.LOG.warning(
+                    'signing_dir mode is %s instead of %s' %
+                    (oct(current_mode), oct(stat.S_IRWXU)))
+        else:
+            os.makedirs(self.signing_dirname, stat.S_IRWXU)
 
         val = '%s/signing_cert.pem' % self.signing_dirname
         self.signing_cert_file_name = val
@@ -283,11 +345,12 @@ class AuthProtocol(object):
         self.token_cache_time = int(self._conf_get('token_cache_time'))
         self._token_revocation_list = None
         self._token_revocation_list_fetched_time = None
-        cache_timeout = datetime.timedelta(seconds=0)
-        self.token_revocation_list_cache_timeout = cache_timeout
+        self.token_revocation_list_cache_timeout = datetime.timedelta(
+            seconds=self._conf_get('revocation_cache_time'))
         http_connect_timeout_cfg = self._conf_get('http_connect_timeout')
         self.http_connect_timeout = (http_connect_timeout_cfg and
                                      int(http_connect_timeout_cfg))
+        self.auth_version = None
 
     def _assert_valid_memcache_protection_config(self):
         if self._memcache_security_strategy:
@@ -307,16 +370,8 @@ class AuthProtocol(object):
             self._cache = env.get(cache)
         else:
             # use Keystone memcache
-            memcache_servers = self._conf_get('memcache_servers')
-            if memcache_servers:
-                try:
-                    import memcache
-                    self.LOG.info('Using Keystone memcache for caching token')
-                    self._cache = memcache.Client(memcache_servers)
-                    self._use_keystone_cache = True
-                except ImportError as e:
-                    msg = 'disabled caching due to missing libraries %s' % (e)
-                    self.LOG.warn(msg)
+            self._cache = memorycache.get_client(memcache_servers)
+            self._use_keystone_cache = True
         self._cache_initialized = True
 
     def _conf_get(self, name):
@@ -325,6 +380,60 @@ class AuthProtocol(object):
             return self.conf[name]
         else:
             return CONF.keystone_authtoken[name]
+
+    def _choose_api_version(self):
+        """ Determine the api version that we should use."""
+
+        # If the configuration specifies an auth_version we will just
+        # assume that is correct and use it.  We could, of course, check
+        # that this version is supported by the server, but in case
+        # there are some problems in the field, we want as little code
+        # as possible in the way of letting auth_token talk to the
+        # server.
+        if self._conf_get('auth_version'):
+            version_to_use = self._conf_get('auth_version')
+            self.LOG.info('Auth Token proceeding with requested %s apis',
+                          version_to_use)
+        else:
+            version_to_use = None
+            versions_supported_by_server = self._get_supported_versions()
+            if versions_supported_by_server:
+                for version in LIST_OF_VERSIONS_TO_ATTEMPT:
+                    if version in versions_supported_by_server:
+                        version_to_use = version
+                        break
+            if version_to_use:
+                self.LOG.info('Auth Token confirmed use of %s apis',
+                              version_to_use)
+            else:
+                self.LOG.error(
+                    'Attempted versions [%s] not in list supported by '
+                    'server [%s]',
+                    ', '.join(LIST_OF_VERSIONS_TO_ATTEMPT),
+                    ', '.join(versions_supported_by_server))
+                raise ServiceError('No compatible apis supported by server')
+        return version_to_use
+
+    def _get_supported_versions(self):
+        versions = []
+        response, data = self._json_request('GET', '/')
+        if response.status != 300:
+            self.LOG.error('Unable to get version info from keystone: %s' %
+                           response.status)
+            raise ServiceError('Unable to get version info from keystone')
+        else:
+            try:
+                for version in data['versions']['values']:
+                    versions.append(version['id'])
+            except KeyError:
+                self.LOG.error(
+                    'Invalid version response format from server', data)
+                raise ServiceError('Unable to parse version response '
+                                   'from keystone')
+
+        self.LOG.debug('Server reports support for api versions: %s',
+                       ', '.join(versions))
+        return versions
 
     def __call__(self, env, start_response):
         """Handle incoming request.
@@ -371,14 +480,22 @@ class AuthProtocol(object):
         """
         auth_headers = (
             'X-Identity-Status',
-            'X-Tenant-Id',
-            'X-Tenant-Name',
+            'X-Domain-Id',
+            'X-Domain-Name',
+            'X-Project-Id',
+            'X-Project-Name',
+            'X-Project-Domain-Id',
+            'X-Project-Domain-Name',
             'X-User-Id',
             'X-User-Name',
+            'X-User-Domain-Id',
+            'X-User-Domain-Name',
             'X-Roles',
             'X-Service-Catalog',
             # Deprecated
             'X-User',
+            'X-Tenant-Id',
+            'X-Tenant-Name',
             'X-Tenant',
             'X-Role',
         )
@@ -449,26 +566,36 @@ class AuthProtocol(object):
                                           self.cert_file,
                                           timeout=self.http_connect_timeout)
 
-    def _http_request(self, method, path):
+    def _http_request(self, method, path, **kwargs):
         """HTTP request helper used to make unspecified content type requests.
 
         :param method: http method
         :param path: relative request url
-        :return (http response object)
+        :return (http response object, response body)
         :raise ServerError when unable to communicate with keystone
 
         """
         conn = self._get_http_connection()
 
-        try:
-            conn.request(method, path)
-            response = conn.getresponse()
-            body = response.read()
-        except Exception as e:
-            self.LOG.error('HTTP connection exception: %s' % e)
-            raise ServiceError('Unable to communicate with keystone')
-        finally:
-            conn.close()
+        RETRIES = 3
+        retry = 0
+
+        while True:
+            try:
+                conn.request(method, path, **kwargs)
+                response = conn.getresponse()
+                body = response.read()
+                break
+            except Exception as e:
+                if retry == RETRIES:
+                    self.LOG.error('HTTP connection exception: %s' % e)
+                    raise ServiceError('Unable to communicate with keystone')
+                # NOTE(vish): sleep 0.5, 1, 2
+                self.LOG.warn('Retrying on HTTP connection exception: %s' % e)
+                time.sleep(2.0 ** retry / 2)
+                retry += 1
+            finally:
+                conn.close()
 
         return response, body
 
@@ -484,8 +611,6 @@ class AuthProtocol(object):
         :raise ServerError when unable to communicate with keystone
 
         """
-        conn = self._get_http_connection()
-
         kwargs = {
             'headers': {
                 'Content-type': 'application/json',
@@ -499,16 +624,9 @@ class AuthProtocol(object):
         if body:
             kwargs['body'] = jsonutils.dumps(body)
 
-        full_path = self.auth_admin_prefix + path
-        try:
-            conn.request(method, full_path, **kwargs)
-            response = conn.getresponse()
-            body = response.read()
-        except Exception as e:
-            self.LOG.error('HTTP connection exception: %s' % e)
-            raise ServiceError('Unable to communicate with keystone')
-        finally:
-            conn.close()
+        path = self.auth_admin_prefix + path
+
+        response, body = self._http_request(method, path, **kwargs)
 
         try:
             data = jsonutils.loads(body)
@@ -523,6 +641,10 @@ class AuthProtocol(object):
 
         :return token id upon success
         :raises ServerError when unable to communicate with keystone
+
+        Irrespective of the auth version we are going to use for the
+        user token, for simplicity we always use a v2 admin token to
+        validate the user token.
 
         """
         params = {
@@ -575,7 +697,8 @@ class AuthProtocol(object):
                 data = json.loads(verified)
             else:
                 data = self.verify_uuid_token(user_token, retry)
-            self._cache_put(token_id, data)
+            expires = self._confirm_token_not_expired(data)
+            self._cache_put(token_id, data, expires)
             return data
         except Exception as e:
             self.LOG.debug('Token validation failure.', exc_info=True)
@@ -583,31 +706,22 @@ class AuthProtocol(object):
             self.LOG.warn("Authorization failed for token %s", user_token)
             raise InvalidUserToken('Token authorization failed')
 
+    def _token_is_v2(self, token_info):
+        return ('access' in token_info)
+
+    def _token_is_v3(self, token_info):
+        return ('token' in token_info)
+
     def _build_user_headers(self, token_info):
         """Convert token object into headers.
 
-        Build headers that represent authenticated user:
-         * X_IDENTITY_STATUS: Confirmed or Invalid
-         * X_TENANT_ID: id of tenant if tenant is present
-         * X_TENANT_NAME: name of tenant if tenant is present
-         * X_USER_ID: id of user
-         * X_USER_NAME: name of user
-         * X_ROLES: list of roles
-         * X_SERVICE_CATALOG: service catalog
-
-        Additional (deprecated) headers include:
-         * X_USER: name of user
-         * X_TENANT: For legacy compatibility before we had ID and Name
-         * X_ROLE: list of roles
+        Build headers that represent authenticated user - see main
+        doc info at start of file for details of headers to be defined.
 
         :param token_info: token object returned by keystone on authentication
         :raise InvalidUserToken when unable to parse token object
 
         """
-        user = token_info['access']['user']
-        token = token_info['access']['token']
-        roles = ','.join([role['name'] for role in user.get('roles', [])])
-
         def get_tenant_info():
             """Returns a (tenant_id, tenant_name) tuple from context."""
             def essex():
@@ -619,7 +733,7 @@ class AuthProtocol(object):
                 return (token['tenantId'], token['tenantId'])
 
             def default_tenant():
-                """Assume the user's default tenant."""
+                """Pre-grizzly, assume the user's default tenant."""
                 return (user['tenantId'], user['tenantName'])
 
             for method in [essex, pre_diablo, default_tenant]:
@@ -630,26 +744,71 @@ class AuthProtocol(object):
 
             raise InvalidUserToken('Unable to determine tenancy.')
 
-        tenant_id, tenant_name = get_tenant_info()
+        # For clarity. set all those attributes that are optional in
+        # either a v2 or v3 token to None first
+        domain_id = None
+        domain_name = None
+        project_id = None
+        project_name = None
+        user_domain_id = None
+        user_domain_name = None
+        project_domain_id = None
+        project_domain_name = None
+
+        if self._token_is_v2(token_info):
+            user = token_info['access']['user']
+            token = token_info['access']['token']
+            roles = ','.join([role['name'] for role in user.get('roles', [])])
+            catalog_root = token_info['access']
+            catalog_key = 'serviceCatalog'
+            project_id, project_name = get_tenant_info()
+        else:
+            #v3 token
+            token = token_info['token']
+            user = token['user']
+            user_domain_id = user['domain']['id']
+            user_domain_name = user['domain']['name']
+            roles = (','.join([role['name']
+                     for role in token.get('roles', [])]))
+            catalog_root = token
+            catalog_key = 'catalog'
+            # For v3, the server will put in the default project if there is
+            # one, so no need for us to add it here (like we do for a v2 token)
+            if 'domain' in token:
+                domain_id = token['domain']['id']
+                domain_name = token['domain']['name']
+            elif 'project' in token:
+                project_id = token['project']['id']
+                project_name = token['project']['name']
+                project_domain_id = token['project']['domain']['id']
+                project_domain_name = token['project']['domain']['name']
 
         user_id = user['id']
         user_name = user['name']
 
         rval = {
             'X-Identity-Status': 'Confirmed',
-            'X-Tenant-Id': tenant_id,
-            'X-Tenant-Name': tenant_name,
+            'X-Domain-Id': domain_id,
+            'X-Domain-Name': domain_name,
+            'X-Project-Id': project_id,
+            'X-Project-Name': project_name,
+            'X-Project-Domain-Id': project_domain_id,
+            'X-Project-Domain-Name': project_domain_name,
             'X-User-Id': user_id,
             'X-User-Name': user_name,
+            'X-User-Domain-Id': user_domain_id,
+            'X-User-Domain-Name': user_domain_name,
             'X-Roles': roles,
             # Deprecated
             'X-User': user_name,
-            'X-Tenant': tenant_name,
+            'X-Tenant-Id': project_id,
+            'X-Tenant-Name': project_name,
+            'X-Tenant': project_name,
             'X-Role': roles,
         }
 
         try:
-            catalog = token_info['access']['serviceCatalog']
+            catalog = catalog_root[catalog_key]
             rval['X-Service-Catalog'] = jsonutils.dumps(catalog)
         except KeyError:
             pass
@@ -773,21 +932,31 @@ class AuthProtocol(object):
                             data_to_store,
                             timeout=self.token_cache_time)
 
-    def _cache_put(self, token, data):
+    def _confirm_token_not_expired(self, data):
+        if not data:
+            raise InvalidUserToken('Token authorization failed')
+        if self._token_is_v2(data):
+            timestamp = data['access']['token']['expires']
+        elif self._token_is_v3(data):
+            timestamp = data['token']['expires_at']
+        else:
+            raise InvalidUserToken('Token authorization failed')
+        expires = timeutils.parse_isotime(timestamp).strftime('%s')
+        if time.time() >= float(expires):
+            self.LOG.debug('Token expired a %s', timestamp)
+            raise InvalidUserToken('Token authorization failed')
+        return expires
+
+    def _cache_put(self, token, data, expires):
         """ Put token data into the cache.
 
         Stores the parsed expire date in cache allowing
         quick check of token freshness on retrieval.
+
         """
-        if self._cache and data:
-            if 'token' in data.get('access', {}):
-                timestamp = data['access']['token']['expires']
-                expires = timeutils.parse_isotime(timestamp).strftime('%s')
-            else:
-                self.LOG.error('invalid token format')
-                return
-            self.LOG.debug('Storing %s token in memcache', token)
-            self._cache_store(token, data, expires)
+        if self._cache:
+                self.LOG.debug('Storing %s token in memcache', token)
+                self._cache_store(token, data, expires)
 
     def _cache_store_invalid(self, token):
         """Store invalid token in cache."""
@@ -811,20 +980,27 @@ class AuthProtocol(object):
         :raise ServiceError if unable to authenticate token
 
         """
+        # Determine the highest api version we can use.
+        if not self.auth_version:
+            self.auth_version = self._choose_api_version()
 
-        headers = {'X-Auth-Token': self.get_admin_token()}
-        response, data = self._json_request(
-            'GET',
-            '/v2.0/tokens/%s' % safe_quote(user_token),
-            additional_headers=headers)
+        if self.auth_version == 'v3.0':
+            headers = {'X-Auth-Token': self.get_admin_token(),
+                       'X-Subject-Token': safe_quote(user_token)}
+            response, data = self._json_request(
+                'GET',
+                '/v3/auth/tokens',
+                additional_headers=headers)
+        else:
+            headers = {'X-Auth-Token': self.get_admin_token()}
+            response, data = self._json_request(
+                'GET',
+                '/v2.0/tokens/%s' % safe_quote(user_token),
+                additional_headers=headers)
 
         if response.status == 200:
-            self._cache_put(user_token, data)
             return data
         if response.status == 404:
-            # FIXME(ja): I'm assuming the 404 status means that user_token is
-            #            invalid - not that the admin_token is invalid
-            self._cache_store_invalid(user_token)
             self.LOG.warn("Authorization failed for token %s", user_token)
             raise InvalidUserToken('Token authorization failed')
         if response.status == 401:
@@ -910,6 +1086,7 @@ class AuthProtocol(object):
         timeout = (self.token_revocation_list_fetched_time +
                    self.token_revocation_list_cache_timeout)
         list_is_current = timeutils.utcnow() < timeout
+
         if list_is_current:
             # Load the list from disk if required
             if not self._token_revocation_list:
