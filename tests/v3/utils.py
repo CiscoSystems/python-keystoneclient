@@ -1,9 +1,10 @@
 import copy
 import json
-import uuid
 import time
 import urlparse
+import uuid
 
+import mock
 import mox
 import requests
 import testtools
@@ -32,6 +33,9 @@ class TestClient(client.Client):
 
 
 class TestCase(testtools.TestCase):
+    TEST_DOMAIN_ID = '1'
+    TEST_DOMAIN_NAME = 'aDomain'
+    TEST_TENANT_ID = '1'
     TEST_TENANT_NAME = 'aTenant'
     TEST_TOKEN = 'aToken'
     TEST_USER = 'test'
@@ -43,12 +47,93 @@ class TestCase(testtools.TestCase):
         'verify': True,
     }
 
+    TEST_SERVICE_CATALOG = [{
+        "endpoints": [{
+            "url": "http://cdn.admin-nets.local:8774/v1.0/",
+            "region": "RegionOne",
+            "interface": "public"
+        }, {
+            "url": "http://127.0.0.1:8774/v1.0",
+            "region": "RegionOne",
+            "interface": "internal"
+        }, {
+            "url": "http://cdn.admin-nets.local:8774/v1.0",
+            "region": "RegionOne",
+            "interface": "admin"
+        }],
+        "type": "nova_compat"
+    }, {
+        "endpoints": [{
+            "url": "http://nova/novapi/public",
+            "region": "RegionOne",
+            "interface": "public"
+        }, {
+            "url": "http://nova/novapi/internal",
+            "region": "RegionOne",
+            "interface": "internal"
+        }, {
+            "url": "http://nova/novapi/admin",
+            "region": "RegionOne",
+            "interface": "admin"
+        }],
+        "type": "compute"
+    }, {
+        "endpoints": [{
+            "url": "http://glance/glanceapi/public",
+            "region": "RegionOne",
+            "interface": "public"
+        }, {
+            "url": "http://glance/glanceapi/internal",
+            "region": "RegionOne",
+            "interface": "internal"
+        }, {
+            "url": "http://glance/glanceapi/admin",
+            "region": "RegionOne",
+            "interface": "admin"
+        }],
+        "type": "image",
+        "name": "glance"
+    }, {
+        "endpoints": [{
+            "url": "http://127.0.0.1:5000/v3",
+            "region": "RegionOne",
+            "interface": "public"
+        }, {
+            "url": "http://127.0.0.1:5000/v3",
+            "region": "RegionOne",
+            "interface": "internal"
+        }, {
+            "url": "http://127.0.0.1:35357/v3",
+            "region": "RegionOne",
+            "interface": "admin"
+        }],
+        "type": "identity"
+    }, {
+        "endpoints": [{
+            "url": "http://swift/swiftapi/public",
+            "region": "RegionOne",
+            "interface": "public"
+        }, {
+            "url": "http://swift/swiftapi/internal",
+            "region": "RegionOne",
+            "interface": "internal"
+        }, {
+            "url": "http://swift/swiftapi/admin",
+            "region": "RegionOne",
+            "interface": "admin"
+        }],
+        "type": "object-store"
+    }]
+
     def setUp(self):
         super(TestCase, self).setUp()
         self.mox = mox.Mox()
-        self._original_time = time.time
-        time.time = lambda: 1234
-        requests.request = self.mox.CreateMockAnything()
+        self.request_patcher = mock.patch.object(requests, 'request',
+                                                 self.mox.CreateMockAnything())
+        self.time_patcher = mock.patch.object(time, 'time',
+                                              lambda: 1234)
+        self.request_patcher.start()
+        self.time_patcher.start()
         self.client = TestClient(username=self.TEST_USER,
                                  token=self.TEST_TOKEN,
                                  tenant_name=self.TEST_TENANT_NAME,
@@ -56,14 +141,15 @@ class TestCase(testtools.TestCase):
                                  endpoint=self.TEST_URL)
 
     def tearDown(self):
-        time.time = self._original_time
+        self.request_patcher.stop()
+        self.time_patcher.stop()
         self.mox.UnsetStubs()
         self.mox.VerifyAll()
         super(TestCase, self).tearDown()
 
 
 class UnauthenticatedTestCase(testtools.TestCase):
-    """ Class used as base for unauthenticated calls """
+    """Class used as base for unauthenticated calls """
     TEST_ROOT_URL = 'http://127.0.0.1:5000/'
     TEST_URL = '%s%s' % (TEST_ROOT_URL, 'v3')
     TEST_ROOT_ADMIN_URL = 'http://127.0.0.1:35357/'
@@ -75,12 +161,16 @@ class UnauthenticatedTestCase(testtools.TestCase):
     def setUp(self):
         super(UnauthenticatedTestCase, self).setUp()
         self.mox = mox.Mox()
-        self._original_time = time.time
-        time.time = lambda: 1234
-        requests.request = self.mox.CreateMockAnything()
+
+        self.request_patcher = mock.patch.object(requests, 'request',
+                                                 self.mox.CreateMockAnything())
+        self.time_patcher = mock.patch.object(time, 'time',
+                                              lambda: 1234)
+        self.request_patcher.start()
 
     def tearDown(self):
-        time.time = self._original_time
+        self.request_patcher.stop()
+        self.time_patcher.stop()
         self.mox.UnsetStubs()
         self.mox.VerifyAll()
         super(UnauthenticatedTestCase, self).tearDown()
@@ -195,6 +285,34 @@ class CrudTests(testtools.TestCase):
         self.assertTrue(len(returned_list))
         [self.assertTrue(isinstance(r, self.model)) for r in returned_list]
 
+    def test_find(self, ref=None):
+        ref = ref or self.new_ref()
+        ref_list = [ref]
+        resp = TestResponse({
+            "status_code": 200,
+            "text": self.serialize(ref_list),
+        })
+
+        method = 'GET'
+        kwargs = copy.copy(self.TEST_REQUEST_BASE)
+        kwargs['headers'] = self.headers[method]
+        query = '?name=%s' % ref['name'] if hasattr(ref, 'name') else ''
+        requests.request(
+            method,
+            urlparse.urljoin(
+                self.TEST_URL,
+                'v3/%s%s' % (self.collection_key, query)),
+            **kwargs).AndReturn((resp))
+        self.mox.ReplayAll()
+
+        returned = self.manager.find(name=getattr(ref, 'name', None))
+        self.assertTrue(isinstance(returned, self.model))
+        for attr in ref:
+            self.assertEqual(
+                getattr(returned, attr),
+                ref[attr],
+                'Expected different %s' % attr)
+
     def test_update(self, ref=None):
         ref = ref or self.new_ref()
         req_ref = ref.copy()
@@ -246,8 +364,9 @@ class CrudTests(testtools.TestCase):
 
 
 class TestResponse(requests.Response):
-    """ Class used to wrap requests.Response and provide some
-        convenience to initialize with a dict """
+    """Class used to wrap requests.Response and provide some
+       convenience to initialize with a dict.
+    """
 
     def __init__(self, data):
         self._text = None

@@ -28,7 +28,6 @@ import webob
 from keystoneclient.common import cms
 from keystoneclient import utils
 from keystoneclient.middleware import auth_token
-from keystoneclient.middleware import memcache_crypt
 from keystoneclient.openstack.common import memorycache
 from keystoneclient.openstack.common import jsonutils
 from keystoneclient.openstack.common import timeutils
@@ -369,7 +368,7 @@ VERSION_LIST_v2 = {
 
 
 class NoModuleFinder(object):
-    """ Disallow further imports of 'module' """
+    """Disallow further imports of 'module'."""
 
     def __init__(self, module):
         self.module = module
@@ -415,10 +414,10 @@ class DisableModuleFixture(fixtures.Fixture):
         sys.meta_path.insert(0, finder)
 
 
-class FakeSwiftMemcacheRing(memorycache.Client):
-    # NOTE(vish): swift memcache uses param timeout instead of time
+class FakeSwiftOldMemcacheClient(memorycache.Client):
+    # NOTE(vish,chmou): old swift memcache uses param timeout instead of time
     def set(self, key, value, timeout=0, min_compress_len=0):
-        sup = super(FakeSwiftMemcacheRing, self)
+        sup = super(FakeSwiftOldMemcacheClient, self)
         sup.set(key, value, timeout, min_compress_len)
 
 
@@ -434,7 +433,7 @@ class FakeHTTPResponse(object):
 class BaseFakeHTTPConnection(object):
 
     def _user_token_responses(self, token_id):
-        """ Emulate user token responses.
+        """Emulate user token responses.
 
         Return success if the token is in the list we know
         about. If the request is for revoked tokens, then return
@@ -474,7 +473,7 @@ class BaseFakeHTTPConnection(object):
 
 
 class FakeHTTPConnection(BaseFakeHTTPConnection):
-    """ Emulate a fake Keystone v2 server """
+    """Emulate a fake Keystone v2 server."""
 
     def __init__(self, *args, **kwargs):
         self.send_valid_revocation_list = True
@@ -520,7 +519,7 @@ class FakeHTTPConnection(BaseFakeHTTPConnection):
 
 
 class v3FakeHTTPConnection(FakeHTTPConnection):
-    """ Emulate a fake Keystone v3 server """
+    """Emulate a fake Keystone v3 server."""
 
     def request(self, method, path, **kwargs):
         """Fakes out several http responses.
@@ -550,7 +549,7 @@ class v3FakeHTTPConnection(FakeHTTPConnection):
 
 
 class RaisingHTTPConnection(FakeHTTPConnection):
-    """ An HTTPConnection that always raises."""
+    """An HTTPConnection that always raises."""
 
     def request(self, method, path, **kwargs):
         raise AssertionError("HTTP request was called.")
@@ -600,7 +599,7 @@ class v3FakeApp(object):
 
 
 class BaseAuthTokenMiddlewareTest(testtools.TestCase):
-    """ Base test class for auth_token middleware.
+    """Base test class for auth_token middleware.
 
     All the tests allow for running with auth_token
     configured for receiving v2 or v3 tokens, with the
@@ -652,7 +651,7 @@ class BaseAuthTokenMiddlewareTest(testtools.TestCase):
         globals()[signed_list] = globals()[valid_signed_list]
 
     def set_fake_http(self, http_handler):
-        """ Configure the http handler for the auth_token middleware.
+        """Configure the http handler for the auth_token middleware.
 
         Allows tests to override the default handler on specific tests,
         e.g. to use v2 for those parts of auth_token that still use v2
@@ -664,7 +663,7 @@ class BaseAuthTokenMiddlewareTest(testtools.TestCase):
 
     def set_middleware(self, fake_app=None, fake_http=None,
                        expected_env=None, conf=None):
-        """ Configure the class ready to call the auth_token middleware.
+        """Configure the class ready to call the auth_token middleware.
 
         Set up the various fake items needed to run the middleware.
         Individual tests that need to further refine these can call this
@@ -806,7 +805,7 @@ class NoMemcacheAuthToken(BaseAuthTokenMiddlewareTest):
             'admin_token': 'admin_token1',
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
-            'memcache_servers': 'localhost:11211',
+            'memcached_servers': 'localhost:11211',
         }
 
         auth_token.AuthProtocol(FakeApp(), conf)
@@ -817,7 +816,7 @@ class NoMemcacheAuthToken(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': 'localhost:11211'
+            'memcached_servers': 'localhost:11211'
         }
         self.set_middleware(conf=conf)
         self.middleware._init_cache(env)
@@ -1013,9 +1012,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
     def _get_cached_token(self, token):
         token_id = cms.cms_hash_token(token)
         # NOTE(vish): example tokens are expired so skip the expiration check.
-        key = self.middleware._get_cache_key(token_id)
-        cached = self.middleware._cache.get(key)
-        return self.middleware._unprotect_cache_value(token, cached)
+        return self.middleware._cache_get(token_id, ignore_expires=True)
 
     def test_memcache(self):
         req = webob.Request.blank('/')
@@ -1036,18 +1033,21 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
         token = 'invalid-token'
         req.headers['X-Auth-Token'] = token
         self.middleware(req.environ, self.start_fake_response)
-        self.assertEqual(self._get_cached_token(token), "invalid")
+        self.assertRaises(auth_token.InvalidUserToken,
+                          self._get_cached_token, token)
 
-    def test_memcache_set_expired(self):
+    def test_memcache_set_expired(self, extra_conf={}, extra_environ={}):
         token_cache_time = 10
         conf = {
             'token_cache_time': token_cache_time,
             'signing_dir': CERTDIR,
         }
+        conf.update(extra_conf)
         self.set_middleware(conf=conf)
         req = webob.Request.blank('/')
         token = self.token_dict['signed_token_scoped']
         req.headers['X-Auth-Token'] = token
+        req.environ.update(extra_environ)
         try:
             now = datetime.datetime.utcnow()
             timeutils.set_time_override(now)
@@ -1059,11 +1059,15 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
         finally:
             timeutils.clear_time_override()
 
+    def test_old_swift_memcache_set_expired(self):
+        extra_conf = {'cache': 'swift.cache'}
+        extra_environ = {'swift.cache': FakeSwiftOldMemcacheClient()}
+        self.test_memcache_set_expired(extra_conf, extra_environ)
+
     def test_swift_memcache_set_expired(self):
-        self.middleware._cache = FakeSwiftMemcacheRing()
-        self.middleware._use_keystone_cache = False
-        self.middleware._cache_initialized = True
-        self.test_memcache_set_expired()
+        extra_conf = {'cache': 'swift.cache'}
+        extra_environ = {'swift.cache': memorycache.Client()}
+        self.test_memcache_set_expired(extra_conf, extra_environ)
 
     def test_use_cache_from_env(self):
         env = {'swift.cache': 'CACHE_TEST'}
@@ -1072,7 +1076,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
             'cache': 'swift.cache',
-            'memcache_servers': ['localhost:11211']
+            'memcached_servers': ['localhost:11211']
         }
         self.set_middleware(conf=conf)
         self.middleware._init_cache(env)
@@ -1091,98 +1095,47 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'encrypt',
             'memcache_secret_key': 'mysecret'
         }
         self.set_middleware(conf=conf)
-        encrypted_data = self.middleware._protect_cache_value(
-            'token', TOKEN_RESPONSES[self.token_dict['uuid_token_default']])
-        self.assertEqual('{ENCRYPT:AES256}', encrypted_data[:16])
-        self.assertEqual(
-            TOKEN_RESPONSES[self.token_dict['uuid_token_default']],
-            self.middleware._unprotect_cache_value('token', encrypted_data))
-        # should return None if unable to decrypt
-        self.assertIsNone(
-            self.middleware._unprotect_cache_value(
-                'token', '{ENCRYPT:AES256}corrupted'))
-        self.assertIsNone(
-            self.middleware._unprotect_cache_value('mykey', encrypted_data))
+        token = 'my_token'
+        data = ('this_data', 10e100)
+        self.middleware._init_cache({})
+        self.middleware._cache_store(token, data)
+        self.assertEqual(self.middleware._cache_get(token), data[0])
 
     def test_sign_cache_data(self):
         conf = {
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'mac',
             'memcache_secret_key': 'mysecret'
         }
         self.set_middleware(conf=conf)
-        signed_data = self.middleware._protect_cache_value(
-            'mykey', TOKEN_RESPONSES[self.token_dict['uuid_token_default']])
-        expected = '{MAC:SHA1}'
-        self.assertEqual(
-            signed_data[:10],
-            expected)
-        self.assertEqual(
-            TOKEN_RESPONSES[self.token_dict['uuid_token_default']],
-            self.middleware._unprotect_cache_value('mykey', signed_data))
-        # should return None on corrupted data
-        self.assertIsNone(
-            self.middleware._unprotect_cache_value('mykey',
-                                                   '{MAC:SHA1}corrupted'))
+        token = 'my_token'
+        data = ('this_data', 10e100)
+        self.middleware._init_cache({})
+        self.middleware._cache_store(token, data)
+        self.assertEqual(self.middleware._cache_get(token), data[0])
 
     def test_no_memcache_protection(self):
         conf = {
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_secret_key': 'mysecret'
         }
         self.set_middleware(conf=conf)
-        data = self.middleware._protect_cache_value('mykey',
-                                                    'This is a test!')
-        self.assertEqual(data, 'This is a test!')
-        self.assertEqual(
-            'This is a test!',
-            self.middleware._unprotect_cache_value('mykey', data))
-
-    def test_get_cache_key(self):
-        conf = {
-            'auth_host': 'keystone.example.com',
-            'auth_port': 1234,
-            'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
-            'memcache_secret_key': 'mysecret'
-        }
-        self.set_middleware(conf=conf)
-        self.assertEqual(
-            'tokens/mytoken',
-            self.middleware._get_cache_key('mytoken'))
-        conf = {
-            'auth_host': 'keystone.example.com',
-            'auth_port': 1234,
-            'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
-            'memcache_security_strategy': 'mac',
-            'memcache_secret_key': 'mysecret'
-        }
-        self.set_middleware(conf=conf)
-        expected = 'tokens/' + memcache_crypt.hash_data('mytoken' + 'mysecret')
-        self.assertEqual(self.middleware._get_cache_key('mytoken'), expected)
-        conf = {
-            'auth_host': 'keystone.example.com',
-            'auth_port': 1234,
-            'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
-            'memcache_security_strategy': 'Encrypt',
-            'memcache_secret_key': 'abc!'
-        }
-        self.set_middleware(conf=conf)
-        expected = 'tokens/' + memcache_crypt.hash_data('mytoken' + 'abc!')
-        self.assertEqual(self.middleware._get_cache_key('mytoken'), expected)
+        token = 'my_token'
+        data = ('this_data', 10e100)
+        self.middleware._init_cache({})
+        self.middleware._cache_store(token, data)
+        self.assertEqual(self.middleware._cache_get(token), data[0])
 
     def test_assert_valid_memcache_protection_config(self):
         # test missing memcache_secret_key
@@ -1190,7 +1143,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'Encrypt'
         }
         self.assertRaises(Exception, self.set_middleware, conf)
@@ -1199,7 +1152,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'whatever'
         }
         self.assertRaises(Exception, self.set_middleware, conf)
@@ -1208,7 +1161,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'mac'
         }
         self.assertRaises(Exception, self.set_middleware, conf)
@@ -1216,7 +1169,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'Encrypt',
             'memcache_secret_key': ''
         }
@@ -1225,7 +1178,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
             'auth_host': 'keystone.example.com',
             'auth_port': 1234,
             'auth_admin_prefix': '/testadmin',
-            'memcache_servers': ['localhost:11211'],
+            'memcached_servers': ['localhost:11211'],
             'memcache_security_strategy': 'mAc',
             'memcache_secret_key': ''
         }
@@ -1244,7 +1197,7 @@ class AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
 
 
 class v2AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
-    """ v2 token specific tests.
+    """v2 token specific tests.
 
     There are some differences between how the auth-token middleware handles
     v2 and v3 tokens over and above the token formats, namely:
@@ -1303,7 +1256,7 @@ class v2AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
         self.assertEqual(body, ['SUCCESS'])
 
     def test_valid_uuid_request_forced_to_2_0(self):
-        """ Test forcing auth_token to use lower api version.
+        """Test forcing auth_token to use lower api version.
 
         By installing the v3 http hander, auth_token will be get
         a version list that looks like a v3 server - from which it
@@ -1341,7 +1294,7 @@ class v2AuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest):
 
 
 class v3AuthTokenMiddlewareTest(AuthTokenMiddlewareTest):
-    """ Test auth_token middleware with v3 tokens.
+    """Test auth_token middleware with v3 tokens.
 
     Re-execute the AuthTokenMiddlewareTest class tests, but with the
     the auth_token middleware configured to expect v3 tokens back from
